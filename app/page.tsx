@@ -64,6 +64,7 @@ export default function RaftDashboard() {
   const [payload, setPayload] = useState('');
   const [submitMsg, setSubmitMsg] = useState('');
   const [peerMsg, setPeerMsg] = useState('');
+  const [electionMsg, setElectionMsg] = useState('');
 
   const fetchState = useCallback(async () => {
     try {
@@ -94,12 +95,27 @@ export default function RaftDashboard() {
     setTimeout(() => setPeerMsg(''), 3000);
   };
 
+  const triggerElection = async () => {
+    const res = await fetch('/api/raft/election', { method: 'POST' });
+    const data = await res.json();
+    setElectionMsg(data.success ? 'Election started' : 'Failed');
+    setTimeout(() => setElectionMsg(''), 3000);
+  };
+
   const removePeer = (url: string) =>
     fetch('/api/raft/peers', {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ url }),
     });
+
+  const nominatePeer = async (peerUrl: string) => {
+    await fetch('/api/raft/nominate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ peerUrl }),
+    });
+  };
 
   const submitEntry = async () => {
     if (!payload.trim()) return;
@@ -148,7 +164,19 @@ export default function RaftDashboard() {
           {raft.state}
         </span>
         <span className="text-xs text-gray-600">term {raft.currentTerm}</span>
-        <div className="ml-auto flex items-center gap-4 text-[11px] text-gray-600">
+        <div className="ml-auto flex items-center gap-3">
+          {electionMsg && (
+            <span className="text-[11px] text-amber-400">{electionMsg}</span>
+          )}
+          <button
+            onClick={triggerElection}
+            disabled={raft.state === 'candidate'}
+            className="px-3 py-1 text-[11px] rounded border border-amber-500/30 bg-amber-500/10 text-amber-400 hover:bg-amber-500/20 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+          >
+            Start Election
+          </button>
+        </div>
+        <div className="flex items-center gap-4 text-[11px] text-gray-600">
           <span>{raft.selfUrl}</span>
           <span className="text-gray-800">{raft.id.slice(0, 8)}…</span>
         </div>
@@ -221,6 +249,7 @@ export default function RaftDashboard() {
                     key={peer.url}
                     peer={peer}
                     onRemove={() => removePeer(peer.url)}
+                    onNominate={() => nominatePeer(peer.url)}
                   />
                 ))
               )}
@@ -331,9 +360,11 @@ function StatBox({
 function PeerRow({
   peer,
   onRemove,
+  onNominate,
 }: {
   peer: PeerInfo;
   onRemove: () => void;
+  onNominate: () => void;
 }) {
   const stateText = peer.state ? STATE[peer.state].text : 'text-gray-600';
   return (
@@ -359,6 +390,13 @@ function PeerRow({
           )}
         </p>
       </div>
+      <button
+        onClick={onNominate}
+        title="Vote for this peer as leader"
+        className="opacity-0 group-hover:opacity-100 px-2 py-0.5 text-[10px] rounded border border-sky-500/30 bg-sky-500/10 text-sky-400 hover:bg-sky-500/20 transition-all"
+      >
+        vote
+      </button>
       <button
         onClick={onRemove}
         className="opacity-0 group-hover:opacity-100 text-gray-600 hover:text-gray-400 text-xs transition-opacity"

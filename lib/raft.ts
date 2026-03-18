@@ -87,6 +87,11 @@ class RaftNode {
     this.resetElectionTimer();
   }
 
+  forceElection() {
+    if (this.electionTimer) clearTimeout(this.electionTimer);
+    this.startElection();
+  }
+
   private async startElection() {
     this.state = 'candidate';
     this.currentTerm++;
@@ -413,16 +418,42 @@ class RaftNode {
     return true;
   }
 
-  addPeer(url: string) {
-    if (url === this.selfUrl || this.peers.has(url)) return;
-    this.peers.set(url, { url, lastSeen: null, state: null, term: null });
+  async nominatePeer(peerUrl: string): Promise<boolean> {
+    // Step down so we don't compete, then ask the peer to run
+    if (this.state === 'leader') this.becomeFollower(this.currentTerm);
+    this.resetElectionTimer();
+    try {
+      await fetch(`${peerUrl}/api/raft/election`, {
+        method: 'POST',
+        signal: AbortSignal.timeout(2000),
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private normalizeUrl(url: string): string {
+    return url.trim().toLowerCase().replace(/\/+$/, '');
+  }
+
+  addPeer(url: string): { ok: boolean; error?: string } {
+    const normalized = this.normalizeUrl(url);
+    if (normalized === this.normalizeUrl(this.selfUrl)) {
+      return { ok: false, error: 'Cannot add self as peer' };
+    }
+    if (this.peers.has(normalized)) {
+      return { ok: false, error: 'Peer already added' };
+    }
+    this.peers.set(normalized, { url: normalized, lastSeen: null, state: null, term: null });
 
     if (this.state === 'leader') {
       const lastIdx =
         this.log.length > 0 ? this.log[this.log.length - 1].index : -1;
-      this.nextIndex.set(url, lastIdx + 1);
-      this.matchIndex.set(url, -1);
+      this.nextIndex.set(normalized, lastIdx + 1);
+      this.matchIndex.set(normalized, -1);
     }
+    return { ok: true };
   }
 
   removePeer(url: string) {
@@ -457,15 +488,27 @@ class RaftNode {
 }
 
 // ─── Singleton ────────────────────────────────────────────────────
+// Bump this whenever the RaftNode class gains new public methods so
+// the stale cached instance is replaced after an HMR reload.
+const RAFT_VERSION = 4;
 
-const g = globalThis as typeof globalThis & { __raftNode?: RaftNode };
+const g = globalThis as typeof globalThis & {
+  __raftNode?: RaftNode;
+  __raftVersion?: number;
+};
 
 export function getRaftNode(): RaftNode {
   const port = process.env.PORT ?? '3000';
   const selfUrl = `http://localhost:${port}`;
 
+  if (g.__raftNode && g.__raftVersion !== RAFT_VERSION) {
+    g.__raftNode.destroy();
+    g.__raftNode = undefined;
+  }
+
   if (!g.__raftNode) {
     g.__raftNode = new RaftNode(selfUrl);
+    g.__raftVersion = RAFT_VERSION;
   }
 
   return g.__raftNode;

@@ -12,7 +12,10 @@ export async function POST(req: NextRequest) {
   if (!url) {
     return NextResponse.json({ error: 'url required' }, { status: 400 });
   }
-  getRaftNode().addPeer(url.trim());
+  const result = getRaftNode().addPeer(url.trim());
+  if (!result.ok) {
+    return NextResponse.json({ error: result.error }, { status: 400 });
+  }
   return NextResponse.json({ success: true });
 }
 
