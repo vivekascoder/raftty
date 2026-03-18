@@ -18,6 +18,15 @@ export interface PeerInfo {
   term: number | null;
 }
 
+export interface MessageEvent {
+  id: string;
+  from: string;
+  to: string;
+  type: 'vote_request' | 'vote_response' | 'append_entries' | 'append_entries_response';
+  timestamp: number;
+  success?: boolean;
+}
+
 class RaftNode {
   readonly id: string;
   readonly selfUrl: string;
@@ -32,6 +41,9 @@ class RaftNode {
   lastApplied = -1;
 
   peers: Map<string, PeerInfo> = new Map();
+
+  networkDelay = 0;
+  messages: MessageEvent[] = [];
 
   // Leader-only volatile state
   private nextIndex: Map<string, number> = new Map();
@@ -51,6 +63,22 @@ class RaftNode {
     this.id = crypto.randomUUID();
     this.selfUrl = selfUrl;
     this.resetElectionTimer();
+  }
+
+  // ─── Delay & message tracking ─────────────────────────────────────
+
+  private delay(ms: number) {
+    if (ms <= 0) return Promise.resolve();
+    return new Promise<void>((r) => setTimeout(r, ms));
+  }
+
+  private logMessage(msg: Omit<MessageEvent, 'id' | 'timestamp'>) {
+    this.messages.push({ ...msg, id: crypto.randomUUID(), timestamp: Date.now() });
+    if (this.messages.length > 200) this.messages = this.messages.slice(-200);
+  }
+
+  setNetworkDelay(ms: number) {
+    this.networkDelay = Math.max(0, Math.min(5000, ms));
   }
 
   // ─── Timer helpers ────────────────────────────────────────────────
@@ -118,6 +146,9 @@ class RaftNode {
     await Promise.all(
       peerUrls.map(async (peerUrl) => {
         try {
+          await this.delay(this.networkDelay);
+          this.logMessage({ from: this.selfUrl, to: peerUrl, type: 'vote_request' });
+
           const res = await fetch(`${peerUrl}/api/raft/vote`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -135,6 +166,8 @@ class RaftNode {
             term: number;
             voteGranted: boolean;
           };
+
+          this.logMessage({ from: peerUrl, to: this.selfUrl, type: 'vote_response', success: vote.voteGranted });
 
           if (vote.term > this.currentTerm) {
             this.becomeFollower(vote.term);
@@ -208,6 +241,9 @@ class RaftNode {
     const entries = this.log.filter((e) => e.index >= nextIdx);
 
     try {
+      await this.delay(this.networkDelay);
+      this.logMessage({ from: this.selfUrl, to: peerUrl, type: 'append_entries' });
+
       const res = await fetch(`${peerUrl}/api/raft/append-entries`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -228,6 +264,8 @@ class RaftNode {
         success: boolean;
         state?: NodeState;
       };
+
+      this.logMessage({ from: peerUrl, to: this.selfUrl, type: 'append_entries_response', success: reply.success });
 
       if (reply.term > this.currentTerm) {
         this.becomeFollower(reply.term);
@@ -299,6 +337,8 @@ class RaftNode {
     lastLogIndex: number;
     lastLogTerm: number;
   }): { term: number; voteGranted: boolean } {
+    this.logMessage({ from: args.candidateUrl, to: this.selfUrl, type: 'vote_request' });
+
     if (args.term < this.currentTerm) {
       return { term: this.currentTerm, voteGranted: false };
     }
@@ -337,6 +377,8 @@ class RaftNode {
     entries: LogEntry[];
     leaderCommit: number;
   }): { term: number; success: boolean; state: NodeState } {
+    this.logMessage({ from: args.leaderUrl, to: this.selfUrl, type: 'append_entries' });
+
     if (args.term < this.currentTerm) {
       return { term: this.currentTerm, success: false, state: this.state };
     }
@@ -478,6 +520,8 @@ class RaftNode {
         ...p,
         isOnline: p.lastSeen !== null && now - p.lastSeen < 3000,
       })),
+      networkDelay: this.networkDelay,
+      messages: this.messages.filter((m) => now - m.timestamp < 8000),
     };
   }
 
