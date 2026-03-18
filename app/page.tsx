@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 
 // ─── Types ────────────────────────────────────────────────────────
 
@@ -22,6 +22,15 @@ interface PeerInfo {
   isOnline: boolean;
 }
 
+interface MessageEvent {
+  id: string;
+  from: string;
+  to: string;
+  type: 'vote_request' | 'vote_response' | 'append_entries' | 'append_entries_response';
+  timestamp: number;
+  success?: boolean;
+}
+
 interface RaftState {
   id: string;
   selfUrl: string;
@@ -33,6 +42,8 @@ interface RaftState {
   lastApplied: number;
   log: LogEntry[];
   peers: PeerInfo[];
+  networkDelay: number;
+  messages: MessageEvent[];
 }
 
 // ─── Color palette per state ──────────────────────────────────────
@@ -42,18 +53,21 @@ const STATE = {
     dot: 'bg-emerald-400',
     badge: 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400',
     text: 'text-emerald-400',
+    color: '#10b981',
   },
   candidate: {
     dot: 'bg-amber-400 animate-pulse',
     badge: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
     text: 'text-amber-400',
+    color: '#f59e0b',
   },
   follower: {
     dot: 'bg-sky-400',
     badge: 'bg-sky-500/10 border-sky-500/30 text-sky-400',
     text: 'text-sky-400',
+    color: '#38bdf8',
   },
-} satisfies Record<NodeState, { dot: string; badge: string; text: string }>;
+} satisfies Record<NodeState, { dot: string; badge: string; text: string; color: string }>;
 
 // ─── Main dashboard ───────────────────────────────────────────────
 
@@ -64,11 +78,17 @@ export default function RaftDashboard() {
   const [payload, setPayload] = useState('');
   const [submitMsg, setSubmitMsg] = useState('');
   const [peerMsg, setPeerMsg] = useState('');
+  const [activeTab, setActiveTab] = useState<'log' | 'graph'>('log');
+  const [localDelay, setLocalDelay] = useState(0);
+  const delayDebounce = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const fetchState = useCallback(async () => {
     try {
       const res = await fetch('/api/raft/state');
-      setRaft(await res.json());
+      const data = await res.json();
+      setRaft(data);
+      // Sync slider only if user isn't actively dragging
+      setLocalDelay((prev) => (Math.abs(prev - data.networkDelay) > 50 ? data.networkDelay : prev));
     } catch {
       // server not ready yet
     }
@@ -79,6 +99,18 @@ export default function RaftDashboard() {
     const id = setInterval(fetchState, 500);
     return () => clearInterval(id);
   }, [fetchState]);
+
+  const handleDelayChange = (ms: number) => {
+    setLocalDelay(ms);
+    if (delayDebounce.current) clearTimeout(delayDebounce.current);
+    delayDebounce.current = setTimeout(() => {
+      fetch('/api/raft/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ networkDelay: ms }),
+      });
+    }, 150);
+  };
 
   const addPeer = async () => {
     const url = peerInput.trim();
@@ -132,7 +164,6 @@ export default function RaftDashboard() {
 
   const s = STATE[raft.state];
   const committed = raft.log.filter((e) => e.index <= raft.commitIndex);
-  const uncommitted = raft.log.filter((e) => e.index > raft.commitIndex);
 
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100 font-mono flex flex-col">
@@ -163,10 +194,7 @@ export default function RaftDashboard() {
             <StatBox label="State" value={raft.state} valueClass={s.text} />
             <StatBox label="Term" value={String(raft.currentTerm)} />
             <StatBox label="Commit index" value={String(raft.commitIndex)} />
-            <StatBox
-              label="Log length"
-              value={String(raft.log.length)}
-            />
+            <StatBox label="Log length" value={String(raft.log.length)} />
             <StatBox
               label="Leader"
               value={
@@ -180,6 +208,32 @@ export default function RaftDashboard() {
               label="Voted for"
               value={raft.votedFor ? raft.votedFor.slice(0, 8) + '…' : '—'}
             />
+          </div>
+
+          {/* Network delay slider */}
+          <div className="px-5 py-4 border-b border-gray-800">
+            <div className="flex items-center justify-between mb-2">
+              <p className="text-[11px] text-gray-500 uppercase tracking-widest">
+                Network Delay
+              </p>
+              <span className="text-[11px] text-gray-300 tabular-nums">
+                {localDelay}ms
+              </span>
+            </div>
+            <input
+              type="range"
+              min={0}
+              max={3000}
+              step={50}
+              value={localDelay}
+              onChange={(e) => handleDelayChange(Number(e.target.value))}
+              className="w-full accent-sky-500 cursor-pointer"
+            />
+            <div className="flex justify-between text-[10px] text-gray-700 mt-1">
+              <span>0ms</span>
+              <span>1500ms</span>
+              <span>3000ms</span>
+            </div>
           </div>
 
           {/* Peers */}
@@ -263,29 +317,52 @@ export default function RaftDashboard() {
             )}
           </div>
 
-          {/* Log */}
-          <div className="flex-1 overflow-auto p-5">
-            <p className="text-[11px] text-gray-500 uppercase tracking-widest mb-3">
-              Replicated log &mdash; {committed.length} committed /{' '}
-              {raft.log.length} total
-            </p>
-
-            {raft.log.length === 0 ? (
-              <p className="text-xs text-gray-700">
-                No log entries yet. Submit data to start replication.
-              </p>
-            ) : (
-              <div className="space-y-1">
-                {[...raft.log].reverse().map((entry) => (
-                  <LogRow
-                    key={`${entry.index}-${entry.term}`}
-                    entry={entry}
-                    committed={entry.index <= raft.commitIndex}
-                  />
-                ))}
-              </div>
-            )}
+          {/* Tab bar */}
+          <div className="flex border-b border-gray-800 flex-shrink-0">
+            {(['log', 'graph'] as const).map((tab) => (
+              <button
+                key={tab}
+                onClick={() => setActiveTab(tab)}
+                className={`px-5 py-2.5 text-[11px] uppercase tracking-widest transition-colors ${
+                  activeTab === tab
+                    ? 'text-gray-200 border-b border-gray-400'
+                    : 'text-gray-600 hover:text-gray-400'
+                }`}
+              >
+                {tab}
+              </button>
+            ))}
           </div>
+
+          {/* Tab content */}
+          {activeTab === 'log' ? (
+            <div className="flex-1 overflow-auto p-5">
+              <p className="text-[11px] text-gray-500 uppercase tracking-widest mb-3">
+                Replicated log &mdash; {committed.length} committed /{' '}
+                {raft.log.length} total
+              </p>
+
+              {raft.log.length === 0 ? (
+                <p className="text-xs text-gray-700">
+                  No log entries yet. Submit data to start replication.
+                </p>
+              ) : (
+                <div className="space-y-1">
+                  {[...raft.log].reverse().map((entry) => (
+                    <LogRow
+                      key={`${entry.index}-${entry.term}`}
+                      entry={entry}
+                      committed={entry.index <= raft.commitIndex}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="flex-1 overflow-hidden">
+              <GraphView raft={raft} />
+            </div>
+          )}
         </div>
       </div>
 
@@ -293,15 +370,264 @@ export default function RaftDashboard() {
       <footer className="border-t border-gray-800 px-6 py-2 flex gap-6 flex-shrink-0">
         {(['leader', 'candidate', 'follower'] as NodeState[]).map((st) => (
           <div key={st} className="flex items-center gap-1.5">
-            <div className={`h-1.5 w-1.5 rounded-full ${STATE[st].dot.replace(' animate-pulse', '')}`} />
+            <div
+              className={`h-1.5 w-1.5 rounded-full ${STATE[st].dot.replace(' animate-pulse', '')}`}
+            />
             <span className={`text-[11px] ${STATE[st].text}`}>{st}</span>
           </div>
         ))}
+        <div className="flex items-center gap-3 text-[11px] text-gray-700 ml-6">
+          <span className="w-2 h-2 rounded-full bg-emerald-500/60 inline-block" />
+          append_entries
+          <span className="w-2 h-2 rounded-full bg-amber-500/60 inline-block ml-2" />
+          vote
+        </div>
         <div className="ml-auto text-[11px] text-gray-700">
-          Run on another port: <span className="text-gray-500">PORT=3001 pnpm dev</span>
+          Run on another port:{' '}
+          <span className="text-gray-500">PORT=3001 pnpm dev</span>
         </div>
       </footer>
     </div>
+  );
+}
+
+// ─── Graph view ───────────────────────────────────────────────────
+
+function GraphView({ raft }: { raft: RaftState }) {
+  const [now, setNow] = useState(Date.now());
+
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 40);
+    return () => clearInterval(id);
+  }, []);
+
+  const W = 800;
+  const H = 480;
+  const cx = W / 2;
+  const cy = H / 2;
+  const NODE_R = 30;
+
+  const nodes = [
+    { url: raft.selfUrl, state: raft.state, isSelf: true },
+    ...raft.peers.map((p) => ({
+      url: p.url,
+      state: (p.state ?? 'follower') as NodeState,
+      isSelf: false,
+      isOnline: p.isOnline,
+    })),
+  ];
+
+  const R = nodes.length === 1 ? 0 : Math.min(W, H) * 0.32;
+
+  const nodePos = new Map<string, { x: number; y: number }>();
+  nodes.forEach((node, i) => {
+    const angle = (2 * Math.PI * i) / nodes.length - Math.PI / 2;
+    nodePos.set(node.url, {
+      x: cx + R * Math.cos(angle),
+      y: cy + R * Math.sin(angle),
+    });
+  });
+
+  // Travel duration = max(400, delay * 1.5) so messages are visible even with 0 delay
+  const travelMs = Math.max(400, raft.networkDelay * 1.5);
+  const activeMessages = raft.messages.filter(
+    (m) => now - m.timestamp < travelMs + 200
+  );
+
+  const isVote = (type: MessageEvent['type']) =>
+    type === 'vote_request' || type === 'vote_response';
+
+  return (
+    <svg
+      viewBox={`0 0 ${W} ${H}`}
+      className="w-full h-full"
+      style={{ background: 'transparent' }}
+    >
+      {/* Grid dots */}
+      {Array.from({ length: 8 }, (_, row) =>
+        Array.from({ length: 14 }, (_, col) => (
+          <circle
+            key={`${row}-${col}`}
+            cx={(col + 0.5) * (W / 14)}
+            cy={(row + 0.5) * (H / 8)}
+            r={1}
+            fill="#1f2937"
+          />
+        ))
+      )}
+
+      {/* Edges between all node pairs */}
+      {nodes.flatMap((a, i) =>
+        nodes.slice(i + 1).map((b) => {
+          const pa = nodePos.get(a.url)!;
+          const pb = nodePos.get(b.url)!;
+          return (
+            <line
+              key={`edge-${a.url}-${b.url}`}
+              x1={pa.x}
+              y1={pa.y}
+              x2={pb.x}
+              y2={pb.y}
+              stroke="#1f2937"
+              strokeWidth={1.5}
+            />
+          );
+        })
+      )}
+
+      {/* In-flight messages */}
+      {activeMessages.map((msg) => {
+        const from = nodePos.get(msg.from);
+        const to = nodePos.get(msg.to);
+        if (!from || !to) return null;
+
+        const age = now - msg.timestamp;
+        const t = Math.min(1, age / travelMs);
+        const eased = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t; // ease-in-out
+        const x = from.x + (to.x - from.x) * eased;
+        const y = from.y + (to.y - from.y) * eased;
+        const opacity = t > 0.85 ? (1 - t) / 0.15 : 1;
+        const color = isVote(msg.type) ? '#f59e0b' : '#10b981';
+        const isFailed = msg.success === false;
+
+        return (
+          <g key={msg.id}>
+            {/* Glow */}
+            <circle
+              cx={x}
+              cy={y}
+              r={8}
+              fill={color}
+              opacity={opacity * 0.15}
+            />
+            {/* Dot */}
+            <circle
+              cx={x}
+              cy={y}
+              r={isFailed ? 3.5 : 4.5}
+              fill={isFailed ? '#6b7280' : color}
+              opacity={opacity}
+            />
+            {/* Label */}
+            {t > 0.1 && t < 0.75 && (
+              <text
+                x={x}
+                y={y - 10}
+                textAnchor="middle"
+                fill={color}
+                fontSize={8}
+                fontFamily="monospace"
+                opacity={opacity * 0.8}
+              >
+                {msg.type === 'append_entries'
+                  ? 'AE'
+                  : msg.type === 'append_entries_response'
+                  ? 'AE↩'
+                  : msg.type === 'vote_request'
+                  ? 'VR'
+                  : 'VR↩'}
+              </text>
+            )}
+          </g>
+        );
+      })}
+
+      {/* Nodes */}
+      {nodes.map((node) => {
+        const pos = nodePos.get(node.url)!;
+        const color = STATE[node.state].color;
+        const label = node.url.replace('http://localhost:', ':');
+        const isOffline = !node.isSelf && (node as { isOnline?: boolean }).isOnline === false;
+
+        return (
+          <g key={node.url}>
+            {/* Outer glow for self */}
+            {node.isSelf && (
+              <circle
+                cx={pos.x}
+                cy={pos.y}
+                r={NODE_R + 10}
+                fill={color}
+                opacity={0.05}
+              />
+            )}
+            {/* Node ring */}
+            <circle
+              cx={pos.x}
+              cy={pos.y}
+              r={NODE_R}
+              fill={isOffline ? '#111827' : `${color}18`}
+              stroke={isOffline ? '#374151' : color}
+              strokeWidth={node.isSelf ? 2 : 1.5}
+              strokeDasharray={isOffline ? '4 3' : undefined}
+            />
+            {/* State label */}
+            <text
+              x={pos.x}
+              y={pos.y - 5}
+              textAnchor="middle"
+              fill={isOffline ? '#4b5563' : color}
+              fontSize={9}
+              fontWeight="bold"
+              fontFamily="monospace"
+            >
+              {node.state.toUpperCase()}
+            </text>
+            {/* URL label */}
+            <text
+              x={pos.x}
+              y={pos.y + 8}
+              textAnchor="middle"
+              fill={isOffline ? '#374151' : '#9ca3af'}
+              fontSize={9}
+              fontFamily="monospace"
+            >
+              {label}
+            </text>
+            {/* Self indicator */}
+            {node.isSelf && (
+              <text
+                x={pos.x}
+                y={pos.y + 19}
+                textAnchor="middle"
+                fill="#4b5563"
+                fontSize={8}
+                fontFamily="monospace"
+              >
+                self
+              </text>
+            )}
+            {/* Offline indicator */}
+            {isOffline && (
+              <text
+                x={pos.x}
+                y={pos.y + 19}
+                textAnchor="middle"
+                fill="#4b5563"
+                fontSize={8}
+                fontFamily="monospace"
+              >
+                offline
+              </text>
+            )}
+          </g>
+        );
+      })}
+
+      {/* Delay watermark */}
+      {raft.networkDelay > 0 && (
+        <text
+          x={W - 12}
+          y={H - 12}
+          textAnchor="end"
+          fill="#374151"
+          fontSize={10}
+          fontFamily="monospace"
+        >
+          delay {raft.networkDelay}ms
+        </text>
+      )}
+    </svg>
   );
 }
 
